@@ -1,20 +1,22 @@
 import os
 import uuid
 import fitz
+import torch
 import streamlit as st
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
 from groq import Groq
-import torch
 
-# Manajemen perangkat (CPU atau GPU)
+# =========================
+# Device Management
+# =========================
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# Initialize embedding model
 embedder = SentenceTransformer("all-MiniLM-L6-v2").to(device)
 
-# Qdrant setup
+# =========================
+# Qdrant Setup
+# =========================
 collection_name = "rag_collection"
 if "qdrant_client" not in st.session_state:
     client = QdrantClient(":memory:")
@@ -28,13 +30,17 @@ if "qdrant_client" not in st.session_state:
         )
 qdrant_client = st.session_state["qdrant_client"]
 
-# PDF reading and chunking
-
+# =========================
+# PDF Reader
+# =========================
 def read_pdf(path: str) -> str:
     with open(path, 'rb') as f:
         doc = fitz.open(stream=f.read(), filetype="pdf")
         return "".join(page.get_text() for page in doc)
 
+# =========================
+# Text Chunker
+# =========================
 def chunk_text(text: str, size: int = 500, overlap: int = 100):
     chunks, start = [], 0
     while start < len(text):
@@ -43,38 +49,48 @@ def chunk_text(text: str, size: int = 500, overlap: int = 100):
         start += size - overlap
     return chunks
 
-# Ingest and embed
-
+# =========================
+# Ingest and Embed
+# =========================
 def process_and_embed(pdf_path: str) -> str:
     doc_id = os.path.splitext(os.path.basename(pdf_path))[0]
     text = read_pdf(pdf_path)
     passages = chunk_text(text)
-    
-    # Encode passages directly (SentenceTransformer handles device management internally)
+
     vectors = embedder.encode(passages, show_progress_bar=False, convert_to_tensor=True)
-    
-    # Convert to list for storage in Qdrant
     if hasattr(vectors, 'cpu'):
         vectors = vectors.cpu().numpy()
-    
-    points = [PointStruct(id=str(uuid.uuid4()), vector=vec.tolist(), payload={"text": txt, "doc_id": doc_id}) for txt, vec in zip(passages, vectors)]
+
+    points = [
+        PointStruct(
+            id=str(uuid.uuid4()),
+            vector=vec.tolist(),
+            payload={"text": passage, "doc_id": doc_id}
+        )
+        for passage, vec in zip(passages, vectors)
+    ]
+
     qdrant_client.upsert(collection_name=collection_name, points=points)
     return doc_id
 
-# Retrieval
-
+# =========================
+# Retrieve Context
+# =========================
 def retrieve_context(query: str, top_k: int = 3) -> str:
     q_vec = embedder.encode([query], convert_to_tensor=True)
-    
-    # Convert to list for Qdrant search
     if hasattr(q_vec, 'cpu'):
         q_vec = q_vec.cpu().numpy()
-    
-    hits = qdrant_client.search(collection_name=collection_name, query_vector=q_vec[0].tolist(), limit=top_k)
+
+    hits = qdrant_client.search(
+        collection_name=collection_name,
+        query_vector=q_vec[0].tolist(),
+        limit=top_k
+    )
     return "\n\n".join(hit.payload["text"] for hit in hits)
 
+# =========================
 # Chatbot with Groq
-
+# =========================
 class Chatbot:
     def __init__(self, model: str):
         api_key = os.getenv("GROQ_API_KEY")
@@ -103,11 +119,49 @@ class Chatbot:
         self.add("assistant", answer)
         return answer
 
-# Streamlit app
+# =========================
+# Streamlit App
+# =========================
 def main():
-    st.title("RAG Chat with PDF")
+    st.set_page_config(page_title="RAG Chat with PDF", layout="wide")
+
+    st.markdown(
+        """
+        <style>
+        .main .block-container {
+            padding-left: 2rem;
+            padding-right: 2rem;
+            padding-top: 1.5rem;
+            padding-bottom: 1.5rem;
+        }
+        .stTextInput > div > div > input {
+            width: 100%;
+        }
+        .stFileUploader {
+            width: 100%;
+        }
+        .chat-bubble {
+            background-color: #f0f2f6;
+            padding: 1rem;
+            border-radius: 10px;
+            margin-bottom: 0.5rem;
+        }
+        .chat-user {
+            background-color: #d2e3fc;
+        }
+        .chat-assistant {
+            background-color: #e9ecef;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.title("🧠 RAG Chat with PDF")
+
     models = ["qwen-qwq-32b", "deepseek-r1-distill-llama-70b"]
     chosen = st.selectbox("Choose model:", models)
+
     if "bot" not in st.session_state or st.session_state["bot"].model != chosen:
         st.session_state["bot"] = Chatbot(chosen)
     bot = st.session_state["bot"]
@@ -118,20 +172,36 @@ def main():
         with open(tmp, "wb") as f:
             f.write(uploaded.read())
         st.success(f"Saved to {tmp}")
-        if st.button("Ingest"):  # ingest trigger
+        if st.button("Ingest"):
             did = process_and_embed(tmp)
             st.success(f"Ingested {did}")
 
-    st.write("## Chat")
+    st.subheader("Chat")
     if "chat_history" not in st.session_state:
         st.session_state["chat_history"] = []
+
     query = st.text_input("Your question:")
     if st.button("Send") and query:
         reply = bot.chat(query)
         st.session_state["chat_history"].append(("You", query))
         st.session_state["chat_history"].append(("Assistant", reply))
+
+    st.subheader("Chat History")
     for user, msg in st.session_state["chat_history"]:
-        st.markdown(f"**{user}:** {msg}")
+        if user == "You":
+            st.markdown(
+                f'<div class="chat-bubble chat-user"><b>{user}:</b> {msg}</div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                f'<div class="chat-bubble chat-assistant"><b>{user}:</b> {msg}</div>',
+                unsafe_allow_html=True
+            )
+
+    if st.button("🗑️ Clear Chat History"):
+        st.session_state["chat_history"] = []
+
 
 if __name__ == "__main__":
     main()
